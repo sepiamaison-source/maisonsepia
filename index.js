@@ -73,6 +73,9 @@ const origins = (env.CORS_ORIGINS || "").split(",").map((s) => s.trim()).filter(
 app.use(cors(origins.length ? { origin: origins } : undefined));
 app.use(express.json({ limit: "100kb" }));
 app.use(express.static(path.join(__dirname, "public")));
+// Réponse simple à la racine, utile pour un moniteur de disponibilité (UptimeRobot, etc.) — ne s'active
+// que si aucun fichier public/index.html n'est déployé ici (le site étant hébergé séparément sur Netlify).
+app.get("/", (req, res) => res.type("text/plain").send(`${SALON_NAME} — serveur de réservation opérationnel.`));
 
 // =======================================================
 // 2. OUTILS
