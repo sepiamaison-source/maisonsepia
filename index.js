@@ -499,7 +499,14 @@ async function syncCalendar() {
     const stateRef = col("settings").doc("sync");
     const since = ((await stateRef.get()).data() || {}).lastSyncMs || now - 10 * 60000;
 
-    const snap = await col("appointments").where("startMs", ">=", now - 2 * DAY_MS).get();
+    // Fenêtre bornée (passé proche -> horizon de réservation + marge) pour limiter le nombre de lectures
+    // Firestore à chaque cycle, au lieu de relire indéfiniment tous les rendez-vous futurs.
+    const { general } = await getSettings();
+    const horizonMs = now + (general.maxAdvanceDays + 7) * DAY_MS;
+    const snap = await col("appointments")
+      .where("startMs", ">=", now - 2 * DAY_MS)
+      .where("startMs", "<=", horizonMs)
+      .get();
     const list = snap.docs.map((d) => ({ id: d.id, ref: d.ref, ...d.data() }));
 
     // 1) Site -> Agenda : ce qui n'a pas pu être envoyé
