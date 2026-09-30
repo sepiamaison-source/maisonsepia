@@ -35,6 +35,7 @@ const MAIL_FROM_EMAIL = env.MAIL_FROM_EMAIL || "";
 const MAIL_FROM_NAME = env.MAIL_FROM_NAME || SALON_NAME;
 const MAX_ACTIVE_BOOKINGS = Number(env.MAX_ACTIVE_BOOKINGS_PER_CLIENT || 3);
 const SYNC_INTERVAL_MS = Math.max(30, Number(env.CALENDAR_SYNC_SECONDS || 120)) * 1000;
+const REMINDER_INTERVAL_MS = 30 * 60 * 1000; // vérifier les rappels toutes les 30 min suffit largement (pas de gain à le faire plus souvent)
 const APPOINTMENT_RETENTION_MONTHS = Math.max(1, Number(env.APPOINTMENT_RETENTION_MONTHS || 6));
 const EVENT_SOURCE = "maison-sepia";
 const BLOCK_EVENT_SOURCE = "maison-sepia-block";
@@ -169,7 +170,7 @@ const DEFAULTS = {
 
 let settingsCache = null;
 async function getSettings() {
-  if (settingsCache && Date.now() - settingsCache.at < 15000) return settingsCache.data;
+  if (settingsCache && Date.now() - settingsCache.at < 60000) return settingsCache.data;
   const [g, s, h] = await db.getAll(col("settings").doc("general"), col("settings").doc("salon"), col("settings").doc("hours"));
   const data = {
     general: { ...DEFAULTS.general, ...(g.data() || {}) },
@@ -182,7 +183,7 @@ async function getSettings() {
 
 let catalogCache = null;
 async function getCatalog() {
-  if (catalogCache && Date.now() - catalogCache.at < 15000) return catalogCache.data;
+  if (catalogCache && Date.now() - catalogCache.at < 60000) return catalogCache.data;
   const [c, s] = await Promise.all([col("categories").get(), col("services").get()]);
   const byOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0) || String(a.name).localeCompare(String(b.name), "fr");
   const data = {
@@ -490,70 +491,74 @@ async function cleanupOldData() {
 }
 
 let syncing = false;
-/** Google Agenda -> site (déplacements / suppressions) + renvoi des modifications en attente. */
+/**
+ * Google Agenda -> site (déplacements / suppressions) + renvoi des modifications en attente.
+ * Optimisé pour le plan gratuit de Firestore : ne relit JAMAIS l'ensemble des rendez-vous à
+ * chaque cycle. Chaque événement Google Agenda créé par le site porte déjà l'identifiant du
+ * rendez-vous (extendedProperties), donc on ne lit que les documents réellement concernés :
+ * ceux en attente d'envoi (`calendarDirty`, normalement aucun) et ceux dont l'événement Google
+ * a effectivement changé depuis le dernier passage (normalement aucun non plus, la plupart du
+ * temps). Un cycle "rien à faire" ne coûte donc que 1 ou 2 lectures Firestore au lieu d'une
+ * lecture par rendez-vous à venir.
+ */
 async function syncCalendar() {
   if (!calendar || syncing) return;
   syncing = true;
   try {
     const now = Date.now();
     const stateRef = col("settings").doc("sync");
-    const since = ((await stateRef.get()).data() || {}).lastSyncMs || now - 10 * 60000;
+    const since = ((await stateRef.get()).data() || {}).lastSyncMs || now - 10 * 60000; // 1 lecture
 
-    // Fenêtre bornée (passé proche -> horizon de réservation + marge) pour limiter le nombre de lectures
-    // Firestore à chaque cycle, au lieu de relire indéfiniment tous les rendez-vous futurs.
-    const { general } = await getSettings();
-    const horizonMs = now + (general.maxAdvanceDays + 7) * DAY_MS;
-    const snap = await col("appointments")
-      .where("startMs", ">=", now - 2 * DAY_MS)
-      .where("startMs", "<=", horizonMs)
-      .get();
-    const list = snap.docs.map((d) => ({ id: d.id, ref: d.ref, ...d.data() }));
+    // 1) Site -> Agenda : uniquement les rendez-vous marqués "à synchroniser" (normalement aucun,
+    //    puisque l'envoi se fait déjà juste après chaque création/modification).
+    const dirtySnap = await col("appointments").where("calendarDirty", "==", true).get(); // 1 lecture minimum, ou N si N en attente
+    for (const d of dirtySnap.docs) await pushToCalendar(d.id, { id: d.id, ...d.data() });
 
-    // 1) Site -> Agenda : ce qui n'a pas pu être envoyé
-    for (const a of list.filter((x) => x.calendarDirty || (isActive(x) && !x.calendarEventId))) {
-      await pushToCalendar(a.id, a);
-    }
+    // 2) Agenda -> site : on demande à Google ce qui a changé depuis le dernier passage (aucun coût
+    //    Firestore), puis on ne va lire QUE les rendez-vous correspondants, un par un, via leur id
+    //    stocké dans l'événement — jamais toute la collection.
+    let pageToken, changed = 0;
+    do {
+      const r = await calendar.events.list({
+        calendarId: CALENDAR_ID,
+        updatedMin: new Date(since - 60000).toISOString(),
+        showDeleted: true,
+        maxResults: 250,
+        pageToken,
+      });
+      for (const ev of r.data.items || []) {
+        const appointmentId = ev.extendedProperties?.private?.source === EVENT_SOURCE ? ev.extendedProperties.private.appointmentId : null;
+        if (!appointmentId) continue; // pas un événement créé par le site (ou un blocage) : on l'ignore
+        changed++;
+        const ref = col("appointments").doc(appointmentId);
+        const snap = await ref.get(); // 1 lecture, seulement pour un rendez-vous réellement modifié dans Google Agenda
+        if (!snap.exists) continue;
+        const a = snap.data();
+        if (!isActive(a)) continue; // déjà annulé/fusionné côté site, rien à répercuter
 
-    // 2) Agenda -> site
-    const byEvent = new Map(
-      list.filter((a) => isActive(a) && a.calendarEventId && !a.calendarDirty).map((a) => [a.calendarEventId, a])
-    );
-    if (byEvent.size) {
-      let pageToken;
-      do {
-        const r = await calendar.events.list({
-          calendarId: CALENDAR_ID,
-          updatedMin: new Date(since - 60000).toISOString(),
-          showDeleted: true,
-          maxResults: 250,
-          pageToken,
-        });
-        for (const ev of r.data.items || []) {
-          const a = byEvent.get(ev.id);
-          if (!a) continue;
-          if (ev.status === "cancelled") {
-            await a.ref.update({ status: "cancelled", cancelledBy: "google-agenda", cancelledAtMs: now, calendarEventId: null, calendarDirty: false });
-            console.log(`🗓️  Rendez-vous ${a.id} annulé depuis Google Agenda.`);
-            continue;
-          }
-          if (!ev.start?.dateTime || !ev.end?.dateTime) continue;
-          const s = Date.parse(ev.start.dateTime);
-          const e = Date.parse(ev.end.dateTime);
-          if (s !== a.startMs || e !== a.endMs) {
-            const p = msToParis(s);
-            await a.ref.update({
-              date: p.date, startTime: p.time, endTime: msToParis(e).time,
-              startMs: s, endMs: e, totalDuration: Math.round((e - s) / 60000),
-              reminderSent: false, updatedAtMs: now,
-            });
-            console.log(`🗓️  Rendez-vous ${a.id} déplacé depuis Google Agenda.`);
-          }
+        if (ev.status === "cancelled") {
+          await ref.update({ status: "cancelled", cancelledBy: "google-agenda", cancelledAtMs: now, calendarEventId: null, calendarDirty: false });
+          console.log(`🗓️  Rendez-vous ${appointmentId} annulé depuis Google Agenda.`);
+          continue;
         }
-        pageToken = r.data.nextPageToken;
-      } while (pageToken);
-    }
+        if (!ev.start?.dateTime || !ev.end?.dateTime) continue;
+        const s = Date.parse(ev.start.dateTime);
+        const e = Date.parse(ev.end.dateTime);
+        if (s !== a.startMs || e !== a.endMs) {
+          const p = msToParis(s);
+          await ref.update({
+            date: p.date, startTime: p.time, endTime: msToParis(e).time,
+            startMs: s, endMs: e, totalDuration: Math.round((e - s) / 60000),
+            reminderSent: false, updatedAtMs: now,
+          });
+          console.log(`🗓️  Rendez-vous ${appointmentId} déplacé depuis Google Agenda.`);
+        }
+      }
+      pageToken = r.data.nextPageToken;
+    } while (pageToken);
+
     await stateRef.set({ lastSyncMs: now }, { merge: true });
-    gcalCache.clear();
+    if (changed || dirtySnap.size) gcalCache.clear();
   } catch (e) {
     console.error("❌ Synchronisation Google Agenda :", e.message);
   } finally {
@@ -1261,6 +1266,7 @@ app.listen(PORT, async () => {
   console.log(`🚀 ${SALON_NAME} – serveur de réservation actif sur le port ${PORT}`);
   try { await seedIfEmpty(); } catch (e) { console.error("❌ Initialisation :", e.message); }
   setTimeout(() => { syncCalendar(); sendReminders(); cleanupOldData(); }, 5000);
-  setInterval(() => { syncCalendar(); sendReminders(); }, SYNC_INTERVAL_MS);
+  setInterval(syncCalendar, SYNC_INTERVAL_MS);
+  setInterval(sendReminders, REMINDER_INTERVAL_MS); // rythme séparé et bien plus lent : pas besoin de vérifier les rappels toutes les 2 min
   setInterval(cleanupOldData, CLEANUP_INTERVAL_MS);
 });
